@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import SimplePeer from 'simple-peer';
+import { QRCodeSVG } from 'qrcode.react';
 
 const SERVER_URL = 'http://localhost:5000';
 const CHUNK_SIZE = 16 * 1024; // 16KB chunks
@@ -20,11 +21,16 @@ function App() {
   const [sendProgress, setSendProgress] = useState(0);
   const [receiveProgress, setReceiveProgress] = useState(0);
   const [receivingFileName, setReceivingFileName] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+  const [transferComplete, setTransferComplete] = useState(false);
+  const [downloadReady, setDownloadReady] = useState(false);
+  const [completedFileUrl, setCompletedFileUrl] = useState(null);
   
   const peerRef = useRef(null);
   const fileChunksRef = useRef([]);
   const receivedBytesRef = useRef(0);
   const totalFileSizeRef = useRef(0);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     // Connect to signaling server
@@ -170,25 +176,24 @@ function App() {
     // Combine all chunks into a single Blob
     const blob = new Blob(fileChunksRef.current);
     
-    // Create a download link
+    // Create a download URL
     const url = URL.createObjectURL(blob);
+    setCompletedFileUrl(url);
+    setDownloadReady(true);
+    setTransferComplete(true);
+    
+    console.log('💾 File ready for download:', receivingFileName);
+    
+    // Auto-download
     const a = document.createElement('a');
     a.href = url;
     a.download = receivingFileName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
     
-    console.log('💾 File downloaded:', receivingFileName);
-    
-    // Reset receiving state
+    // Reset receiving state (but keep the completed status for UI)
     setReceiving(false);
-    setReceiveProgress(0);
-    setReceivingFileName('');
-    fileChunksRef.current = [];
-    receivedBytesRef.current = 0;
-    totalFileSizeRef.current = 0;
   };
 
   const sendFile = async () => {
@@ -238,6 +243,12 @@ function App() {
     setSending(false);
     setSendProgress(0);
     setSelectedFile(null);
+    setTransferComplete(true);
+    
+    // Reset after a delay
+    setTimeout(() => {
+      setTransferComplete(false);
+    }, 3000);
   };
 
   const handleFileSelect = (e) => {
@@ -245,7 +256,102 @@ function App() {
     if (file) {
       console.log('📁 File selected:', file.name, file.size, 'bytes');
       setSelectedFile(file);
+      setTransferComplete(false);
+      setDownloadReady(false);
     }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    
+    const file = e.dataTransfer.files[0];
+    if (file && peerConnected && !sending && !receiving) {
+      console.log('📁 File dropped:', file.name, file.size, 'bytes');
+      setSelectedFile(file);
+      setTransferComplete(false);
+      setDownloadReady(false);
+      // Auto-send on drop
+      setTimeout(() => {
+        sendFileDirectly(file);
+      }, 100);
+    }
+  };
+
+  const sendFileDirectly = async (file) => {
+    if (!file || !peerRef.current) return;
+    
+    setSending(true);
+    setSendProgress(0);
+    
+    console.log('📤 Preparing to send file:', file.name, file.size, 'bytes');
+    
+    // Step 1: Send metadata
+    const metadata = {
+      type: 'metadata',
+      name: file.name,
+      size: file.size
+    };
+    
+    peerRef.current.send(JSON.stringify(metadata));
+    console.log('📨 Metadata sent:', metadata);
+    
+    // Step 2: Read file as ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+    const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
+    console.log('📦 File will be sent in', totalChunks, 'chunks of', CHUNK_SIZE, 'bytes');
+    
+    // Step 3: Send chunks
+    let offset = 0;
+    let chunkNumber = 0;
+    
+    while (offset < arrayBuffer.byteLength) {
+      const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
+      peerRef.current.send(chunk);
+      
+      offset += CHUNK_SIZE;
+      chunkNumber++;
+      
+      const progress = (offset / arrayBuffer.byteLength) * 100;
+      setSendProgress(Math.min(progress, 100));
+      
+      console.log(`📤 Sent chunk ${chunkNumber}/${totalChunks} (${progress.toFixed(1)}%)`);
+      
+      // Small delay to prevent overwhelming the connection
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    console.log('✅ File sending complete!');
+    setSending(false);
+    setSendProgress(0);
+    setSelectedFile(null);
+    setTransferComplete(true);
+    
+    // Reset after a delay
+    setTimeout(() => {
+      setTransferComplete(false);
+    }, 3000);
+  };
+
+  const formatFileSize = (bytes) => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   };
 
   const joinRoom = () => {
@@ -267,25 +373,33 @@ function App() {
   // Lobby View - Before joining a room
   if (!currentRoom) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full">
-          <h1 className="text-4xl font-bold text-center mb-2 bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
-            AirBridge
-          </h1>
-          <p className="text-center text-gray-600 mb-8">Local-First File Transfer</p>
+      <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-black flex items-center justify-center p-4">
+        <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8 max-w-md w-full backdrop-blur-lg">
+          {/* Logo/Title */}
+          <div className="text-center mb-8">
+            <div className="inline-block p-4 bg-blue-600 rounded-2xl mb-4">
+              <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+              </svg>
+            </div>
+            <h1 className="text-4xl font-bold text-white mb-2">
+              AirBridge
+            </h1>
+            <p className="text-gray-400 text-sm">Local-First File Transfer</p>
+          </div>
 
-          <div className="space-y-4">
+          <div className="space-y-6">
             {/* Connection Status */}
-            <div className="flex items-center justify-center gap-2 p-3 bg-gray-50 rounded-lg">
-              <div className={`w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-              <span className="text-sm font-medium">
-                {connected ? 'Connected to server' : 'Disconnected'}
+            <div className="flex items-center justify-center gap-2 p-3 bg-gray-900 rounded-xl border border-gray-700">
+              <div className={`w-2.5 h-2.5 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+              <span className="text-sm font-medium text-gray-300">
+                {connected ? 'Server Connected' : 'Connecting...'}
               </span>
             </div>
 
-            {/* Room Join */}
-            <div className="space-y-2">
-              <label className="block text-sm font-medium text-gray-700">
+            {/* Room Input */}
+            <div className="space-y-3">
+              <label className="block text-sm font-semibold text-gray-300">
                 Room ID
               </label>
               <input
@@ -293,21 +407,23 @@ function App() {
                 value={roomId}
                 onChange={(e) => setRoomId(e.target.value)}
                 onKeyPress={(e) => e.key === 'Enter' && joinRoom()}
-                placeholder="Enter room ID (e.g., test123)"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="Enter room code"
+                className="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
               />
               <button
                 onClick={joinRoom}
                 disabled={!connected || !roomId.trim()}
-                className="w-full bg-blue-600 text-white py-2 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition"
+                className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed transition transform hover:scale-105 active:scale-95"
               >
                 Join Room
               </button>
             </div>
 
-            {/* Console Hint */}
-            <div className="text-xs text-gray-500 text-center pt-4 border-t">
-              Open browser console to see connection logs
+            {/* Info */}
+            <div className="text-center pt-4 border-t border-gray-700">
+              <p className="text-xs text-gray-500">
+                WebRTC • Peer-to-Peer • No Upload Limits
+              </p>
             </div>
           </div>
         </div>
@@ -317,161 +433,245 @@ function App() {
 
   // Sharing View - After joining a room
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-lg w-full">
-        <h1 className="text-3xl font-bold text-center mb-2 bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
-          AirBridge
-        </h1>
-        <p className="text-center text-gray-600 mb-6">Room: {currentRoom}</p>
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-black p-4 md:p-8">
+      <div className="max-w-4xl mx-auto">
+        {/* Header */}
+        <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-6 mb-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-white mb-1">AirBridge</h1>
+              <p className="text-gray-400 text-sm">Room: <span className="text-blue-400 font-mono">{currentRoom}</span></p>
+            </div>
+            <button
+              onClick={() => {
+                if (peerRef.current) {
+                  peerRef.current.destroy();
+                  peerRef.current = null;
+                }
+                setCurrentRoom('');
+                setPeerConnected(false);
+                setRoomId('');
+                setTransferComplete(false);
+                setDownloadReady(false);
+                if (completedFileUrl) {
+                  URL.revokeObjectURL(completedFileUrl);
+                }
+              }}
+              className="px-4 py-2 bg-gray-700 text-gray-300 rounded-xl font-medium hover:bg-gray-600 transition"
+            >
+              Leave
+            </button>
+          </div>
 
-        <div className="space-y-4">
-          {/* Connection Status Cards */}
-          <div className="grid grid-cols-2 gap-4">
-            {/* Server Connection */}
-            <div className="p-4 bg-gray-50 rounded-lg">
+          {/* Connection Status */}
+          <div className="grid grid-cols-2 gap-4 mt-6">
+            <div className="p-3 bg-gray-900 rounded-xl border border-gray-700">
               <div className="flex items-center gap-2 mb-1">
                 <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                <span className="text-xs font-medium text-gray-600">Server</span>
+                <span className="text-xs font-medium text-gray-400">Signaling</span>
               </div>
-              <p className="text-sm font-semibold">
+              <p className="text-sm font-semibold text-white">
                 {connected ? 'Connected' : 'Disconnected'}
               </p>
             </div>
 
-            {/* P2P Connection */}
-            <div className="p-4 bg-gray-50 rounded-lg">
+            <div className="p-3 bg-gray-900 rounded-xl border border-gray-700">
               <div className="flex items-center gap-2 mb-1">
-                <div className={`w-2 h-2 rounded-full ${peerConnected ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
-                <span className="text-xs font-medium text-gray-600">Peer</span>
+                <div className={`w-2 h-2 rounded-full ${peerConnected ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`}></div>
+                <span className="text-xs font-medium text-gray-400">Peer-to-Peer</span>
               </div>
-              <p className="text-sm font-semibold">
+              <p className="text-sm font-semibold text-white">
                 {peerConnected ? 'Connected' : 'Waiting...'}
               </p>
             </div>
           </div>
+        </div>
 
-          {/* Status Message */}
-          <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
-            {!peerConnected ? (
-              <div>
-                <p className="text-sm font-medium text-blue-900 mb-1">
-                  Waiting for peer...
-                </p>
-                <p className="text-xs text-blue-700">
-                  {isInitiator 
-                    ? '📱 You are the initiator. Share this room ID with another device.' 
-                    : '🔗 Connecting to the initiator...'}
-                </p>
+        {/* Main Transfer Area */}
+        <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8">
+          {!peerConnected ? (
+            /* Waiting for Peer */
+            <div className="text-center py-12">
+              <div className="inline-block p-6 bg-gray-900 rounded-2xl mb-6">
+                <svg className="w-16 h-16 text-gray-400 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                </svg>
               </div>
-            ) : (
-              <div>
-                <p className="text-sm font-medium text-green-900 mb-1">
-                  🎉 P2P Connection Established!
-                </p>
-                <p className="text-xs text-green-700">
-                  Direct connection active. You can now transfer files.
-                </p>
-              </div>
-            )}
-          </div>
+              <h3 className="text-xl font-semibold text-white mb-2">Waiting for peer...</h3>
+              <p className="text-gray-400 mb-8">
+                {isInitiator 
+                  ? 'Share this room code with another device' 
+                  : 'Connecting to initiator...'}
+              </p>
+              
+              {/* QR Code */}
+              {isInitiator && (
+                <div className="inline-block p-6 bg-white rounded-2xl">
+                  <QRCodeSVG 
+                    value={`${window.location.origin}?room=${currentRoom}`} 
+                    size={200}
+                    level="H"
+                  />
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Connected - Drop Zone */
+            <div>
+              {/* Transfer Complete Message */}
+              {transferComplete && (
+                <div className="mb-6 p-4 bg-green-900 border border-green-700 rounded-xl">
+                  <div className="flex items-center gap-3">
+                    <svg className="w-6 h-6 text-green-400" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-semibold text-green-300">Transfer Complete!</p>
+                      <p className="text-xs text-green-400">File sent successfully</p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
-          {/* File Transfer Section */}
-          {peerConnected && (
-            <div className="space-y-4 pt-4 border-t">
-              {/* Receiving Status */}
+              {/* Download Ready Message */}
+              {downloadReady && (
+                <div className="mb-6 p-4 bg-blue-900 border border-blue-700 rounded-xl">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <svg className="w-6 h-6 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" />
+                      </svg>
+                      <div>
+                        <p className="text-sm font-semibold text-blue-300">{receivingFileName}</p>
+                        <p className="text-xs text-blue-400">Download complete</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const a = document.createElement('a');
+                        a.href = completedFileUrl;
+                        a.download = receivingFileName;
+                        a.click();
+                      }}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition"
+                    >
+                      Download Again
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Receiving Progress */}
               {receiving && (
-                <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
-                  <p className="text-sm font-medium text-green-900 mb-2">
-                    📥 Receiving: {receivingFileName}
-                  </p>
-                  <div className="w-full bg-green-200 rounded-full h-2 mb-1">
+                <div className="mb-6 p-6 bg-gray-900 border border-gray-700 rounded-xl">
+                  <div className="flex items-center gap-3 mb-4">
+                    <svg className="w-6 h-6 text-blue-400 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-semibold text-white">Receiving: {receivingFileName}</p>
+                      <p className="text-xs text-gray-400">{formatFileSize(receivedBytesRef.current)} / {formatFileSize(totalFileSizeRef.current)}</p>
+                    </div>
+                  </div>
+                  <div className="w-full bg-gray-700 rounded-full h-3 mb-2">
                     <div 
-                      className="bg-green-600 h-2 rounded-full transition-all duration-300"
+                      className="bg-blue-600 h-3 rounded-full transition-all duration-300"
                       style={{ width: `${receiveProgress}%` }}
                     ></div>
                   </div>
-                  <p className="text-xs text-green-700">
-                    {receiveProgress.toFixed(1)}% complete
+                  <p className="text-center text-sm font-semibold text-blue-400">
+                    {receiveProgress.toFixed(1)}%
                   </p>
                 </div>
               )}
 
-              {/* Send File */}
-              <div className="space-y-2">
-                <label className="block text-sm font-medium text-gray-700">
-                  Send a file
-                </label>
-                <input
-                  type="file"
-                  onChange={handleFileSelect}
-                  disabled={sending || receiving}
-                  className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
-                />
-                
-                {selectedFile && (
-                  <div className="p-3 bg-gray-50 rounded-lg">
-                    <p className="text-sm font-medium text-gray-800">{selectedFile.name}</p>
-                    <p className="text-xs text-gray-600">
-                      {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
-                    </p>
-                  </div>
-                )}
-
-                {sending && (
-                  <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
-                    <p className="text-sm font-medium text-blue-900 mb-2">
-                      📤 Sending: {selectedFile?.name}
-                    </p>
-                    <div className="w-full bg-blue-200 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                        style={{ width: `${sendProgress}%` }}
-                      ></div>
+              {/* Sending Progress */}
+              {sending && (
+                <div className="mb-6 p-6 bg-gray-900 border border-gray-700 rounded-xl">
+                  <div className="flex items-center gap-3 mb-4">
+                    <svg className="w-6 h-6 text-green-400 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3 3m0 0l-3-3m-3 3v12" />
+                    </svg>
+                    <div>
+                      <p className="text-sm font-semibold text-white">Sending: {selectedFile?.name}</p>
+                      <p className="text-xs text-gray-400">{formatFileSize(selectedFile?.size || 0)}</p>
                     </div>
-                    <p className="text-xs text-blue-700">
-                      {sendProgress.toFixed(1)}% complete
-                    </p>
                   </div>
-                )}
+                  <div className="w-full bg-gray-700 rounded-full h-3 mb-2">
+                    <div 
+                      className="bg-green-600 h-3 rounded-full transition-all duration-300"
+                      style={{ width: `${sendProgress}%` }}
+                    ></div>
+                  </div>
+                  <p className="text-center text-sm font-semibold text-green-400">
+                    {sendProgress.toFixed(1)}%
+                  </p>
+                </div>
+              )}
 
-                <button
-                  onClick={sendFile}
-                  disabled={!selectedFile || sending || receiving}
-                  className="w-full bg-blue-600 text-white py-2 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition"
+              {/* Drop Zone */}
+              {!sending && !receiving && (
+                <div
+                  onDragOver={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  className={`relative border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300 ${
+                    isDragging 
+                      ? 'border-blue-500 bg-blue-900 bg-opacity-20 scale-105' 
+                      : 'border-gray-600 hover:border-gray-500 hover:bg-gray-900'
+                  }`}
                 >
-                  {sending ? 'Sending...' : 'Send File'}
-                </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    onChange={handleFileSelect}
+                    className="hidden"
+                  />
+                  
+                  <div className="space-y-4">
+                    <div className="inline-block p-6 bg-gray-900 rounded-2xl">
+                      <svg className="w-16 h-16 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                      </svg>
+                    </div>
+                    
+                    <div>
+                      <h3 className="text-xl font-semibold text-white mb-2">
+                        {isDragging ? 'Drop file here' : 'Drop files to send'}
+                      </h3>
+                      <p className="text-gray-400 text-sm">
+                        or click to browse
+                      </p>
+                    </div>
+
+                    {selectedFile && !isDragging && (
+                      <div className="mt-6 p-4 bg-gray-900 rounded-xl border border-gray-700 inline-block">
+                        <p className="text-sm font-semibold text-white">{selectedFile.name}</p>
+                        <p className="text-xs text-gray-400">{formatFileSize(selectedFile.size)}</p>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            sendFile();
+                          }}
+                          className="mt-3 px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition"
+                        >
+                          Send File
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Info */}
+              <div className="mt-6 text-center">
+                <p className="text-xs text-gray-500">
+                  Files are transferred directly via WebRTC • No server upload • No size limits
+                </p>
               </div>
             </div>
           )}
-
-          {/* Info Box */}
-          <div className="p-4 bg-gray-50 rounded-lg">
-            <p className="text-xs text-gray-600 mb-2">
-              <strong>Role:</strong> {isInitiator ? 'Initiator (First to join)' : 'Receiver (Second to join)'}
-            </p>
-            <p className="text-xs text-gray-500">
-              {peerConnected 
-                ? 'Files are transferred directly between devices via WebRTC.' 
-                : 'Open browser console (F12) to see WebRTC handshake details.'}
-            </p>
-          </div>
-
-          {/* Leave Room Button */}
-          <button
-            onClick={() => {
-              if (peerRef.current) {
-                peerRef.current.destroy();
-                peerRef.current = null;
-              }
-              setCurrentRoom('');
-              setPeerConnected(false);
-              setRoomId('');
-            }}
-            className="w-full bg-gray-200 text-gray-700 py-2 rounded-lg font-medium hover:bg-gray-300 transition"
-          >
-            Leave Room
-          </button>
         </div>
       </div>
     </div>
