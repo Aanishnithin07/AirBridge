@@ -55,8 +55,20 @@ io.on('connection', (socket) => {
 
   // Handle WebRTC signaling
   socket.on('signal', ({ to, signal }) => {
-    console.log(`📡 Forwarding signal from ${socket.id} to ${to}`);
-    io.to(to).emit('signal', { from: socket.id, signal });
+    console.log(`📡 Forwarding signal from ${socket.id}`);
+    
+    // If 'to' is specified, send to that specific user
+    // Otherwise, broadcast to everyone in the room except sender
+    if (to) {
+      io.to(to).emit('signal', { from: socket.id, signal });
+    } else {
+      // Find which room the socket is in and broadcast to others
+      socket.rooms.forEach((room) => {
+        if (room !== socket.id) {
+          socket.to(room).emit('signal', { from: socket.id, signal });
+        }
+      });
+    }
   });
 
   // Handle disconnection
