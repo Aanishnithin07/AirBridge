@@ -6,12 +6,25 @@ import { QRCodeSVG } from 'qrcode.react';
 const SERVER_URL = 'http://localhost:5000';
 const CHUNK_SIZE = 16 * 1024; // 16KB chunks
 
+// Connection state machine
+const ConnectionState = {
+  DISCONNECTED: 'DISCONNECTED',
+  SIGNALING: 'SIGNALING',
+  CONNECTING: 'CONNECTING',
+  CONNECTED: 'CONNECTED',
+  FAILED: 'FAILED',
+  RECONNECTING: 'RECONNECTING'
+};
+
+const MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_DELAY = 2000; // 2 seconds
+
 function App() {
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
   const [roomId, setRoomId] = useState('');
   const [currentRoom, setCurrentRoom] = useState('');
-  const [peerConnected, setPeerConnected] = useState(false);
+  const [connectionState, setConnectionState] = useState(ConnectionState.DISCONNECTED);
   const [isInitiator, setIsInitiator] = useState(false);
   
   // File transfer states
@@ -31,75 +44,134 @@ function App() {
   const receivedBytesRef = useRef(0);
   const totalFileSizeRef = useRef(0);
   const fileInputRef = useRef(null);
+  
+  // Production-grade refs
+  const iceCandidateQueueRef = useRef([]);
+  const remoteDescriptionSetRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef = useRef(null);
+  const isReconnectingRef = useRef(false);
+
+  // Verbose logging utility
+  const log = {
+    info: (message, ...args) => {
+      console.log(`[INFO] ${new Date().toISOString()} - ${message}`, ...args);
+    },
+    warn: (message, ...args) => {
+      console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, ...args);
+    },
+    error: (message, ...args) => {
+      console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, ...args);
+    },
+    signal: (type, data) => {
+      console.log(`[SIGNAL] ${new Date().toISOString()} - ${type}`, data);
+    },
+    state: (oldState, newState) => {
+      console.log(`[STATE] ${new Date().toISOString()} - ${oldState} → ${newState}`);
+    }
+  };
 
   useEffect(() => {
     // Connect to signaling server
+    log.info('Initializing socket connection to signaling server');
     const newSocket = io(SERVER_URL);
 
     newSocket.on('connect', () => {
-      console.log('✅ Connected to signaling server:', newSocket.id);
+      log.info('✅ Connected to signaling server:', newSocket.id);
       setConnected(true);
       setSocket(newSocket);
+      setConnectionState(ConnectionState.DISCONNECTED);
     });
 
     newSocket.on('disconnect', () => {
-      console.log('❌ Disconnected from signaling server');
+      log.warn('❌ Disconnected from signaling server');
       setConnected(false);
-      setPeerConnected(false);
+      setConnectionState(ConnectionState.DISCONNECTED);
     });
 
     // When existing users in room are sent (we are joining an occupied room)
     newSocket.on('room-users', (users) => {
-      console.log('👥 Existing users in room:', users);
+      log.info('👥 Existing users in room:', users);
       
       if (users.length > 0) {
         // We are NOT the initiator (someone was already in the room)
-        console.log('📱 Joining as RECEIVER (non-initiator)');
+        log.info('📱 Joining as RECEIVER (non-initiator)');
         setIsInitiator(false);
+        setConnectionState(ConnectionState.SIGNALING);
       } else {
         // We are the first one, we will be the initiator
-        console.log('🎯 Joining as INITIATOR (first in room)');
+        log.info('🎯 Joining as INITIATOR (first in room)');
         setIsInitiator(true);
+        setConnectionState(ConnectionState.SIGNALING);
       }
     });
 
     // When a new user connects to our room
     newSocket.on('user-connected', (userId) => {
-      console.log('👤 User connected:', userId);
+      log.info('👤 User connected:', userId);
       
       // If we are the initiator, start the WebRTC connection
-      if (peerRef.current === null) {
-        console.log('🤝 Initiating P2P connection as INITIATOR');
+      if (peerRef.current === null && !isReconnectingRef.current) {
+        log.info('🤝 Initiating P2P connection as INITIATOR');
+        setConnectionState(ConnectionState.CONNECTING);
         createPeer(true, newSocket);
       }
     });
 
     // Receive WebRTC signal from the other peer
     newSocket.on('signal', ({ from, signal }) => {
-      console.log('📡 Received signal from:', from);
+      log.signal('RECEIVED', { from, signalType: signal.type });
       
       // If we don't have a peer yet, create one as receiver
-      if (peerRef.current === null) {
-        console.log('🤝 Creating P2P connection as RECEIVER');
+      if (peerRef.current === null && !isReconnectingRef.current) {
+        log.info('🤝 Creating P2P connection as RECEIVER');
+        setConnectionState(ConnectionState.CONNECTING);
         createPeer(false, newSocket);
       }
       
       // Signal the peer with incoming data
       if (peerRef.current) {
-        peerRef.current.signal(signal);
+        try {
+          peerRef.current.signal(signal);
+          
+          // Mark that remote description has been set if this is an answer/offer
+          if (signal.type === 'answer' || signal.type === 'offer') {
+            remoteDescriptionSetRef.current = true;
+            log.info('Remote description set, processing queued ICE candidates');
+            
+            // Process queued ICE candidates
+            while (iceCandidateQueueRef.current.length > 0) {
+              const candidate = iceCandidateQueueRef.current.shift();
+              log.info('Processing queued ICE candidate');
+              try {
+                peerRef.current.signal(candidate);
+              } catch (err) {
+                log.error('Error processing queued ICE candidate:', err);
+              }
+            }
+          }
+          
+          // If this is an ICE candidate and remote description isn't set, queue it
+          if (signal.candidate && !remoteDescriptionSetRef.current) {
+            log.info('Queuing ICE candidate (remote description not set yet)');
+            iceCandidateQueueRef.current.push(signal);
+          }
+        } catch (err) {
+          log.error('Error signaling peer:', err);
+        }
       }
     });
 
     newSocket.on('user-disconnected', (userId) => {
-      console.log('👋 User disconnected:', userId);
-      setPeerConnected(false);
-      if (peerRef.current) {
-        peerRef.current.destroy();
-        peerRef.current = null;
-      }
+      log.warn('👋 User disconnected:', userId);
+      handlePeerDisconnection();
     });
 
     return () => {
+      log.info('Cleaning up socket connection');
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
       if (peerRef.current) {
         peerRef.current.destroy();
       }
@@ -107,22 +179,81 @@ function App() {
     };
   }, []);
 
+  const handlePeerDisconnection = () => {
+    log.warn('Handling peer disconnection');
+    const oldState = connectionState;
+    setConnectionState(ConnectionState.DISCONNECTED);
+    log.state(oldState, ConnectionState.DISCONNECTED);
+    
+    if (peerRef.current) {
+      peerRef.current.destroy();
+      peerRef.current = null;
+    }
+    
+    // Reset ICE candidate queue and flags
+    iceCandidateQueueRef.current = [];
+    remoteDescriptionSetRef.current = false;
+  };
+
+  const attemptReconnection = (initiator, socket) => {
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      log.error('Max reconnection attempts reached. Giving up.');
+      setConnectionState(ConnectionState.FAILED);
+      isReconnectingRef.current = false;
+      return;
+    }
+
+    reconnectAttemptsRef.current += 1;
+    isReconnectingRef.current = true;
+    setConnectionState(ConnectionState.RECONNECTING);
+    
+    log.info(`Attempting reconnection (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+
+    reconnectTimeoutRef.current = setTimeout(() => {
+      log.info('Creating new peer connection after delay');
+      createPeer(initiator, socket);
+    }, RECONNECT_DELAY);
+  };
+
   const createPeer = (initiator, socket) => {
+    log.info('Creating peer connection', { initiator, trickle: false });
+    
+    // Reset flags for new connection
+    iceCandidateQueueRef.current = [];
+    remoteDescriptionSetRef.current = false;
+    
     const peer = new SimplePeer({
       initiator: initiator,
       trickle: false, // Send all ICE candidates at once
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+      }
     });
 
     // When WebRTC signal is ready, send it to the other peer via Socket.io
     peer.on('signal', (signalData) => {
-      console.log('📤 Sending signal data to peer');
-      socket.emit('signal', { to: null, signal: signalData }); // Server will broadcast to room
+      log.signal('SENT', { signalType: signalData.type, sdp: signalData.sdp ? 'present' : 'absent' });
+      socket.emit('signal', { to: null, signal: signalData });
     });
 
     // When direct P2P connection is established
     peer.on('connect', () => {
-      console.log('🎉 DIRECT P2P CONNECTION ESTABLISHED!');
-      setPeerConnected(true);
+      log.info('🎉 DIRECT P2P CONNECTION ESTABLISHED!');
+      const oldState = connectionState;
+      setConnectionState(ConnectionState.CONNECTED);
+      log.state(oldState, ConnectionState.CONNECTED);
+      
+      // Reset reconnection attempts on successful connection
+      reconnectAttemptsRef.current = 0;
+      isReconnectingRef.current = false;
+      
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
     });
 
     // Handle incoming data (file chunks or metadata)
@@ -132,7 +263,7 @@ function App() {
         const message = JSON.parse(data.toString());
         
         if (message.type === 'metadata') {
-          console.log('📦 Receiving file metadata:', message);
+          log.info('📦 Receiving file metadata:', message);
           setReceivingFileName(message.name);
           totalFileSizeRef.current = message.size;
           receivedBytesRef.current = 0;
@@ -142,32 +273,73 @@ function App() {
         }
       } catch (e) {
         // Not JSON, must be a file chunk (ArrayBuffer)
-        console.log('📥 Received chunk, size:', data.length);
         fileChunksRef.current.push(data);
         receivedBytesRef.current += data.length;
         
         const progress = (receivedBytesRef.current / totalFileSizeRef.current) * 100;
         setReceiveProgress(progress);
         
+        // Log every 10% progress
+        if (Math.floor(progress) % 10 === 0 && progress > 0) {
+          log.info(`📥 Receive progress: ${progress.toFixed(1)}%`);
+        }
+        
         // Check if we've received the complete file
         if (receivedBytesRef.current >= totalFileSizeRef.current) {
-          console.log('✅ File transfer complete! Assembling file...');
+          log.info('✅ File transfer complete! Assembling file...');
           assembleAndDownloadFile();
         }
       }
     });
 
-    // Handle errors
+    // Handle errors with reconnection logic
     peer.on('error', (err) => {
-      console.error('❌ Peer connection error:', err);
+      log.error('❌ Peer connection error:', err.message);
+      
+      // Don't reconnect if we're already connected (likely a data channel error)
+      if (connectionState === ConnectionState.CONNECTED) {
+        log.warn('Error on established connection, not reconnecting');
+        return;
+      }
+      
+      // Clean up current peer
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+      
+      // Attempt reconnection if not already reconnecting
+      if (!isReconnectingRef.current) {
+        attemptReconnection(initiator, socket);
+      }
     });
 
+    // Handle connection close
     peer.on('close', () => {
-      console.log('🔌 Peer connection closed');
-      setPeerConnected(false);
+      log.warn('🔌 Peer connection closed');
+      const oldState = connectionState;
+      
+      // Only attempt reconnection if we were connected or connecting
+      if (oldState === ConnectionState.CONNECTED || oldState === ConnectionState.CONNECTING) {
+        log.info('Connection was active, attempting reconnection');
+        
+        // Clean up current peer
+        if (peerRef.current) {
+          peerRef.current.destroy();
+          peerRef.current = null;
+        }
+        
+        if (!isReconnectingRef.current) {
+          attemptReconnection(initiator, socket);
+        }
+      } else {
+        setConnectionState(ConnectionState.DISCONNECTED);
+        log.state(oldState, ConnectionState.DISCONNECTED);
+      }
     });
 
     peerRef.current = peer;
+    log.info('Peer reference stored, waiting for connection...');
   };
 
   const assembleAndDownloadFile = () => {
@@ -279,8 +451,10 @@ function App() {
     setIsDragging(false);
     
     const file = e.dataTransfer.files[0];
-    if (file && peerConnected && !sending && !receiving) {
-      console.log('📁 File dropped:', file.name, file.size, 'bytes');
+    const isPeerConnected = connectionState === ConnectionState.CONNECTED;
+    
+    if (file && isPeerConnected && !sending && !receiving) {
+      log.info('📁 File dropped:', file.name, file.size, 'bytes');
       setSelectedFile(file);
       setTransferComplete(false);
       setDownloadReady(false);
@@ -297,7 +471,7 @@ function App() {
     setSending(true);
     setSendProgress(0);
     
-    console.log('📤 Preparing to send file:', file.name, file.size, 'bytes');
+    log.info('📤 Preparing to send file:', file.name, file.size, 'bytes');
     
     // Step 1: Send metadata
     const metadata = {
@@ -307,12 +481,12 @@ function App() {
     };
     
     peerRef.current.send(JSON.stringify(metadata));
-    console.log('📨 Metadata sent:', metadata);
+    log.info('📨 Metadata sent:', metadata);
     
     // Step 2: Read file as ArrayBuffer
     const arrayBuffer = await file.arrayBuffer();
     const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
-    console.log('📦 File will be sent in', totalChunks, 'chunks of', CHUNK_SIZE, 'bytes');
+    log.info('📦 File will be sent in', totalChunks, 'chunks of', CHUNK_SIZE, 'bytes');
     
     // Step 3: Send chunks
     let offset = 0;
@@ -328,13 +502,16 @@ function App() {
       const progress = (offset / arrayBuffer.byteLength) * 100;
       setSendProgress(Math.min(progress, 100));
       
-      console.log(`📤 Sent chunk ${chunkNumber}/${totalChunks} (${progress.toFixed(1)}%)`);
+      // Log every 10% progress
+      if (Math.floor(progress) % 10 === 0 && progress > 0) {
+        log.info(`📤 Send progress: ${progress.toFixed(1)}% (chunk ${chunkNumber}/${totalChunks})`);
+      }
       
       // Small delay to prevent overwhelming the connection
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     
-    console.log('✅ File sending complete!');
+    log.info('✅ File sending complete!');
     setSending(false);
     setSendProgress(0);
     setSelectedFile(null);
@@ -449,10 +626,15 @@ function App() {
                   peerRef.current = null;
                 }
                 setCurrentRoom('');
-                setPeerConnected(false);
+                setConnectionState(ConnectionState.DISCONNECTED);
                 setRoomId('');
                 setTransferComplete(false);
                 setDownloadReady(false);
+                reconnectAttemptsRef.current = 0;
+                isReconnectingRef.current = false;
+                if (reconnectTimeoutRef.current) {
+                  clearTimeout(reconnectTimeoutRef.current);
+                }
                 if (completedFileUrl) {
                   URL.revokeObjectURL(completedFileUrl);
                 }
@@ -477,11 +659,27 @@ function App() {
 
             <div className="p-3 bg-gray-900 rounded-xl border border-gray-700">
               <div className="flex items-center gap-2 mb-1">
-                <div className={`w-2 h-2 rounded-full ${peerConnected ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`}></div>
+                <div className={`w-2 h-2 rounded-full ${
+                  connectionState === ConnectionState.CONNECTED 
+                    ? 'bg-green-500 animate-pulse' 
+                    : connectionState === ConnectionState.CONNECTING || connectionState === ConnectionState.RECONNECTING
+                    ? 'bg-yellow-500 animate-pulse'
+                    : connectionState === ConnectionState.FAILED
+                    ? 'bg-red-500'
+                    : 'bg-gray-500'
+                }`}></div>
                 <span className="text-xs font-medium text-gray-400">Peer-to-Peer</span>
               </div>
               <p className="text-sm font-semibold text-white">
-                {peerConnected ? 'Connected' : 'Waiting...'}
+                {connectionState === ConnectionState.CONNECTED 
+                  ? 'Connected' 
+                  : connectionState === ConnectionState.CONNECTING 
+                  ? 'Connecting...'
+                  : connectionState === ConnectionState.RECONNECTING
+                  ? `Reconnecting (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`
+                  : connectionState === ConnectionState.FAILED
+                  ? 'Failed'
+                  : 'Waiting...'}
               </p>
             </div>
           </div>
@@ -489,23 +687,41 @@ function App() {
 
         {/* Main Transfer Area */}
         <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8">
-          {!peerConnected ? (
+          {connectionState !== ConnectionState.CONNECTED ? (
             /* Waiting for Peer */
             <div className="text-center py-12">
               <div className="inline-block p-6 bg-gray-900 rounded-2xl mb-6">
-                <svg className="w-16 h-16 text-gray-400 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
-                </svg>
+                {connectionState === ConnectionState.FAILED ? (
+                  <svg className="w-16 h-16 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                ) : (
+                  <svg className="w-16 h-16 text-gray-400 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                  </svg>
+                )}
               </div>
-              <h3 className="text-xl font-semibold text-white mb-2">Waiting for peer...</h3>
+              <h3 className="text-xl font-semibold text-white mb-2">
+                {connectionState === ConnectionState.FAILED 
+                  ? 'Connection Failed' 
+                  : connectionState === ConnectionState.RECONNECTING
+                  ? `Reconnecting... (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`
+                  : connectionState === ConnectionState.CONNECTING
+                  ? 'Connecting to peer...'
+                  : 'Waiting for peer...'}
+              </h3>
               <p className="text-gray-400 mb-8">
-                {isInitiator 
+                {connectionState === ConnectionState.FAILED
+                  ? 'Unable to establish P2P connection. Please try again.'
+                  : connectionState === ConnectionState.RECONNECTING
+                  ? 'Connection lost. Attempting to reconnect...'
+                  : isInitiator 
                   ? 'Share this room code with another device' 
                   : 'Connecting to initiator...'}
               </p>
               
               {/* QR Code */}
-              {isInitiator && (
+              {isInitiator && connectionState !== ConnectionState.FAILED && (
                 <div className="inline-block p-6 bg-white rounded-2xl">
                   <QRCodeSVG 
                     value={`${window.location.origin}?room=${currentRoom}`} 
@@ -668,6 +884,9 @@ function App() {
               <div className="mt-6 text-center">
                 <p className="text-xs text-gray-500">
                   Files are transferred directly via WebRTC • No server upload • No size limits
+                  {connectionState === ConnectionState.RECONNECTING && (
+                    <> • Reconnecting...</>
+                  )}
                 </p>
               </div>
             </div>
