@@ -4,7 +4,8 @@ import SimplePeer from 'simple-peer';
 import { QRCodeSVG } from 'qrcode.react';
 
 const SERVER_URL = 'http://localhost:5000';
-const CHUNK_SIZE = 16 * 1024; // 16KB chunks
+const CHUNK_SIZE = 64 * 1024; // 64KB chunks for better LAN throughput
+const SPEED_CALC_INTERVAL = 1000; // Calculate speed every second
 
 // Connection state machine
 const ConnectionState = {
@@ -38,6 +39,8 @@ function App() {
   const [transferComplete, setTransferComplete] = useState(false);
   const [downloadReady, setDownloadReady] = useState(false);
   const [completedFileUrl, setCompletedFileUrl] = useState(null);
+  const [transferSpeed, setTransferSpeed] = useState(0); // MB/s
+  const [receiveSpeed, setReceiveSpeed] = useState(0); // MB/s
   
   const peerRef = useRef(null);
   const fileChunksRef = useRef([]);
@@ -51,6 +54,12 @@ function App() {
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef(null);
   const isReconnectingRef = useRef(false);
+  
+  // Performance tracking refs
+  const lastSpeedCalcTimeRef = useRef(0);
+  const bytesSentSinceLastCalcRef = useRef(0);
+  const bytesReceivedSinceLastCalcRef = useRef(0);
+  const sendAbortControllerRef = useRef(null);
 
   // Verbose logging utility
   const log = {
@@ -270,23 +279,41 @@ function App() {
           fileChunksRef.current = [];
           setReceiving(true);
           setReceiveProgress(0);
+          setReceiveSpeed(0);
+          
+          // Initialize speed calculation
+          lastSpeedCalcTimeRef.current = Date.now();
+          bytesReceivedSinceLastCalcRef.current = 0;
         }
       } catch (e) {
         // Not JSON, must be a file chunk (ArrayBuffer)
         fileChunksRef.current.push(data);
         receivedBytesRef.current += data.length;
+        bytesReceivedSinceLastCalcRef.current += data.length;
         
         const progress = (receivedBytesRef.current / totalFileSizeRef.current) * 100;
         setReceiveProgress(progress);
         
-        // Log every 10% progress
-        if (Math.floor(progress) % 10 === 0 && progress > 0) {
-          log.info(`📥 Receive progress: ${progress.toFixed(1)}%`);
+        // Calculate receive speed every second
+        const now = Date.now();
+        const timeDiff = now - lastSpeedCalcTimeRef.current;
+        
+        if (timeDiff >= SPEED_CALC_INTERVAL) {
+          const bytesPerSecond = (bytesReceivedSinceLastCalcRef.current / timeDiff) * 1000;
+          const mbPerSecond = bytesPerSecond / (1024 * 1024);
+          setReceiveSpeed(mbPerSecond);
+          
+          log.info(`📥 Receive speed: ${mbPerSecond.toFixed(2)} MB/s | Progress: ${progress.toFixed(1)}%`);
+          
+          // Reset for next interval
+          lastSpeedCalcTimeRef.current = now;
+          bytesReceivedSinceLastCalcRef.current = 0;
         }
         
         // Check if we've received the complete file
         if (receivedBytesRef.current >= totalFileSizeRef.current) {
           log.info('✅ File transfer complete! Assembling file...');
+          setReceiveSpeed(0);
           assembleAndDownloadFile();
         }
       }
@@ -370,63 +397,13 @@ function App() {
 
   const sendFile = async () => {
     if (!selectedFile || !peerRef.current) return;
-    
-    setSending(true);
-    setSendProgress(0);
-    
-    console.log('📤 Preparing to send file:', selectedFile.name, selectedFile.size, 'bytes');
-    
-    // Step 1: Send metadata
-    const metadata = {
-      type: 'metadata',
-      name: selectedFile.name,
-      size: selectedFile.size
-    };
-    
-    peerRef.current.send(JSON.stringify(metadata));
-    console.log('📨 Metadata sent:', metadata);
-    
-    // Step 2: Read file as ArrayBuffer
-    const arrayBuffer = await selectedFile.arrayBuffer();
-    const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
-    console.log('📦 File will be sent in', totalChunks, 'chunks of', CHUNK_SIZE, 'bytes');
-    
-    // Step 3: Send chunks
-    let offset = 0;
-    let chunkNumber = 0;
-    
-    while (offset < arrayBuffer.byteLength) {
-      const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-      peerRef.current.send(chunk);
-      
-      offset += CHUNK_SIZE;
-      chunkNumber++;
-      
-      const progress = (offset / arrayBuffer.byteLength) * 100;
-      setSendProgress(Math.min(progress, 100));
-      
-      console.log(`📤 Sent chunk ${chunkNumber}/${totalChunks} (${progress.toFixed(1)}%)`);
-      
-      // Small delay to prevent overwhelming the connection
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    
-    console.log('✅ File sending complete!');
-    setSending(false);
-    setSendProgress(0);
-    setSelectedFile(null);
-    setTransferComplete(true);
-    
-    // Reset after a delay
-    setTimeout(() => {
-      setTransferComplete(false);
-    }, 3000);
+    await sendFileDirectly(selectedFile);
   };
 
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
     if (file) {
-      console.log('📁 File selected:', file.name, file.size, 'bytes');
+      log.info('📁 File selected:', file.name, file.size, 'bytes');
       setSelectedFile(file);
       setTransferComplete(false);
       setDownloadReady(false);
@@ -468,10 +445,16 @@ function App() {
   const sendFileDirectly = async (file) => {
     if (!file || !peerRef.current) return;
     
+    // Create abort controller for cancellation
+    sendAbortControllerRef.current = new AbortController();
+    const { signal } = sendAbortControllerRef.current;
+    
     setSending(true);
     setSendProgress(0);
+    setTransferSpeed(0);
     
     log.info('📤 Preparing to send file:', file.name, file.size, 'bytes');
+    log.info(`Using chunk size: ${CHUNK_SIZE} bytes (${(CHUNK_SIZE / 1024).toFixed(0)}KB)`);
     
     // Step 1: Send metadata
     const metadata = {
@@ -480,47 +463,107 @@ function App() {
       size: file.size
     };
     
-    peerRef.current.send(JSON.stringify(metadata));
-    log.info('📨 Metadata sent:', metadata);
+    try {
+      peerRef.current.send(JSON.stringify(metadata));
+      log.info('📨 Metadata sent:', metadata);
+    } catch (err) {
+      log.error('Failed to send metadata:', err);
+      setSending(false);
+      return;
+    }
     
     // Step 2: Read file as ArrayBuffer
     const arrayBuffer = await file.arrayBuffer();
     const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
-    log.info('📦 File will be sent in', totalChunks, 'chunks of', CHUNK_SIZE, 'bytes');
+    log.info(`📦 File will be sent in ${totalChunks} chunks`);
     
-    // Step 3: Send chunks
+    // Initialize speed tracking
+    lastSpeedCalcTimeRef.current = Date.now();
+    bytesSentSinceLastCalcRef.current = 0;
+    
+    // Step 3: Send chunks with backpressure control
     let offset = 0;
     let chunkNumber = 0;
     
-    while (offset < arrayBuffer.byteLength) {
-      const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-      peerRef.current.send(chunk);
+    const sendNextChunk = () => {
+      if (signal.aborted) {
+        log.warn('File transfer aborted');
+        setSending(false);
+        setTransferSpeed(0);
+        return;
+      }
       
-      offset += CHUNK_SIZE;
+      if (offset >= arrayBuffer.byteLength) {
+        // Transfer complete
+        log.info('✅ File sending complete!');
+        setSending(false);
+        setSendProgress(100);
+        setTransferSpeed(0);
+        setSelectedFile(null);
+        setTransferComplete(true);
+        
+        // Reset after a delay
+        setTimeout(() => {
+          setTransferComplete(false);
+        }, 3000);
+        return;
+      }
+      
+      // Slice the next chunk (efficient - doesn't copy memory, creates view)
+      const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
       chunkNumber++;
       
+      // Attempt to write the chunk
+      let canContinue;
+      try {
+        canContinue = peerRef.current.write(chunk);
+      } catch (err) {
+        log.error('Error writing chunk:', err);
+        setSending(false);
+        setTransferSpeed(0);
+        return;
+      }
+      
+      offset += chunk.byteLength;
+      bytesSentSinceLastCalcRef.current += chunk.byteLength;
+      
+      // Update progress
       const progress = (offset / arrayBuffer.byteLength) * 100;
       setSendProgress(Math.min(progress, 100));
       
-      // Log every 10% progress
-      if (Math.floor(progress) % 10 === 0 && progress > 0) {
-        log.info(`📤 Send progress: ${progress.toFixed(1)}% (chunk ${chunkNumber}/${totalChunks})`);
+      // Calculate and update speed
+      const now = Date.now();
+      const timeDiff = now - lastSpeedCalcTimeRef.current;
+      
+      if (timeDiff >= SPEED_CALC_INTERVAL) {
+        const bytesPerSecond = (bytesSentSinceLastCalcRef.current / timeDiff) * 1000;
+        const mbPerSecond = bytesPerSecond / (1024 * 1024);
+        setTransferSpeed(mbPerSecond);
+        
+        log.info(`📤 Speed: ${mbPerSecond.toFixed(2)} MB/s | Progress: ${progress.toFixed(1)}% | Chunk ${chunkNumber}/${totalChunks}`);
+        
+        // Reset for next interval
+        lastSpeedCalcTimeRef.current = now;
+        bytesSentSinceLastCalcRef.current = 0;
       }
       
-      // Small delay to prevent overwhelming the connection
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
+      // Backpressure control
+      if (canContinue) {
+        // Buffer not full, can send next chunk immediately
+        // Use setImmediate pattern for better performance
+        setTimeout(sendNextChunk, 0);
+      } else {
+        // Buffer is full, wait for drain event
+        log.info('⏸️  Backpressure detected, waiting for drain event...');
+        peerRef.current.once('drain', () => {
+          log.info('▶️  Drain event received, resuming transfer');
+          sendNextChunk();
+        });
+      }
+    };
     
-    log.info('✅ File sending complete!');
-    setSending(false);
-    setSendProgress(0);
-    setSelectedFile(null);
-    setTransferComplete(true);
-    
-    // Reset after a delay
-    setTimeout(() => {
-      setTransferComplete(false);
-    }, 3000);
+    // Start sending
+    sendNextChunk();
   };
 
   const formatFileSize = (bytes) => {
@@ -784,10 +827,16 @@ function App() {
                     <svg className="w-6 h-6 text-blue-400 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
                     </svg>
-                    <div>
+                    <div className="flex-1">
                       <p className="text-sm font-semibold text-white">Receiving: {receivingFileName}</p>
                       <p className="text-xs text-gray-400">{formatFileSize(receivedBytesRef.current)} / {formatFileSize(totalFileSizeRef.current)}</p>
                     </div>
+                    {receiveSpeed > 0 && (
+                      <div className="text-right">
+                        <p className="text-sm font-bold text-blue-400">{receiveSpeed.toFixed(2)} MB/s</p>
+                        <p className="text-xs text-gray-500">⚡ Speed</p>
+                      </div>
+                    )}
                   </div>
                   <div className="w-full bg-gray-700 rounded-full h-3 mb-2">
                     <div 
@@ -808,10 +857,16 @@ function App() {
                     <svg className="w-6 h-6 text-green-400 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3 3m0 0l-3-3m-3 3v12" />
                     </svg>
-                    <div>
+                    <div className="flex-1">
                       <p className="text-sm font-semibold text-white">Sending: {selectedFile?.name}</p>
                       <p className="text-xs text-gray-400">{formatFileSize(selectedFile?.size || 0)}</p>
                     </div>
+                    {transferSpeed > 0 && (
+                      <div className="text-right">
+                        <p className="text-sm font-bold text-green-400">{transferSpeed.toFixed(2)} MB/s</p>
+                        <p className="text-xs text-gray-500">⚡ Speed</p>
+                      </div>
+                    )}
                   </div>
                   <div className="w-full bg-gray-700 rounded-full h-3 mb-2">
                     <div 
