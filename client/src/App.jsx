@@ -49,6 +49,7 @@ function App() {
   const [declineReason, setDeclineReason] = useState('');
   
   const peerRef = useRef(null);
+  const socketRef = useRef(null); // Socket reference for consent protocol
   const fileChunksRef = useRef([]);
   const receivedBytesRef = useRef(0);
   const totalFileSizeRef = useRef(0);
@@ -105,6 +106,7 @@ function App() {
       log.info('✅ Connected to signaling server:', newSocket.id);
       setConnected(true);
       setSocket(newSocket);
+      socketRef.current = newSocket; // Store socket in ref for consent protocol
       setConnectionState(ConnectionState.DISCONNECTED);
       
       // Auto-join if room ID was in URL
