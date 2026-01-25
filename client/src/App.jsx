@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 import SimplePeer from 'simple-peer';
 import { QRCodeSVG } from 'qrcode.react';
 
-const SERVER_URL = 'http://localhost:5000';
+const SERVER_URL = 'http://localhost:5001';
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for better LAN throughput
 const SPEED_CALC_INTERVAL = 1000; // Calculate speed every second
 
@@ -42,6 +42,12 @@ function App() {
   const [transferSpeed, setTransferSpeed] = useState(0); // MB/s
   const [receiveSpeed, setReceiveSpeed] = useState(0); // MB/s
   
+  // Consent protocol states
+  const [transferRequest, setTransferRequest] = useState(null); // { from, metadata }
+  const [waitingForAcceptance, setWaitingForAcceptance] = useState(false);
+  const [transferDeclined, setTransferDeclined] = useState(false);
+  const [declineReason, setDeclineReason] = useState('');
+  
   const peerRef = useRef(null);
   const fileChunksRef = useRef([]);
   const receivedBytesRef = useRef(0);
@@ -60,6 +66,7 @@ function App() {
   const bytesSentSinceLastCalcRef = useRef(0);
   const bytesReceivedSinceLastCalcRef = useRef(0);
   const sendAbortControllerRef = useRef(null);
+  const pendingFileRef = useRef(null); // File waiting for acceptance
 
   // Verbose logging utility
   const log = {
@@ -174,6 +181,40 @@ function App() {
     newSocket.on('user-disconnected', (userId) => {
       log.warn('👋 User disconnected:', userId);
       handlePeerDisconnection();
+    });
+
+    // Handle transfer request (consent protocol)
+    newSocket.on('transfer-request', ({ from, metadata }) => {
+      log.info('📨 Received transfer request from:', from, metadata);
+      setTransferRequest({ from, metadata });
+    });
+
+    // Handle transfer acceptance
+    newSocket.on('transfer-accepted', ({ from }) => {
+      log.info('✅ Transfer accepted by:', from);
+      setWaitingForAcceptance(false);
+      
+      // Start sending the file
+      if (pendingFileRef.current) {
+        log.info('Starting file transfer after acceptance');
+        startFileTransfer(pendingFileRef.current);
+        pendingFileRef.current = null;
+      }
+    });
+
+    // Handle transfer rejection
+    newSocket.on('transfer-rejected', ({ from, reason }) => {
+      log.warn('❌ Transfer rejected by:', from, 'Reason:', reason);
+      setWaitingForAcceptance(false);
+      setTransferDeclined(true);
+      setDeclineReason(reason || 'User declined the transfer');
+      pendingFileRef.current = null;
+      
+      // Reset after delay
+      setTimeout(() => {
+        setTransferDeclined(false);
+        setDeclineReason('');
+      }, 5000);
     });
 
     return () => {
@@ -397,7 +438,71 @@ function App() {
 
   const sendFile = async () => {
     if (!selectedFile || !peerRef.current) return;
-    await sendFileDirectly(selectedFile);
+
+    if (connectionState !== 'CONNECTED') {
+      log.error('❌ Cannot send file: Peer not connected. State:', connectionState);
+      return;
+    }
+
+    // Prepare metadata
+    const metadata = {
+      name: selectedFile.name,
+      size: selectedFile.size,
+      type: selectedFile.type,
+    };
+
+    log.info('📤 Sending transfer request:', metadata);
+    
+    // Store file for later (after acceptance)
+    pendingFileRef.current = selectedFile;
+    
+    // Send transfer request to receiver
+    if (socketRef.current) {
+      socketRef.current.emit('transfer-request', {
+        roomId,
+        metadata,
+      });
+      
+      setWaitingForAcceptance(true);
+      log.info('⏳ Waiting for receiver to accept...');
+    }
+  };
+
+  const startFileTransfer = (file) => {
+    log.info('🚀 Starting actual file transfer');
+    sendFileDirectly(file);
+  };
+
+  const handleAcceptTransfer = () => {
+    if (!transferRequest || !socketRef.current) return;
+
+    log.info('✅ Accepting transfer from:', transferRequest.from);
+    
+    // Emit acceptance to sender
+    socketRef.current.emit('transfer-accepted', {
+      roomId,
+      to: transferRequest.from,
+    });
+
+    // Close modal
+    setTransferRequest(null);
+  };
+
+  const handleDeclineTransfer = () => {
+    if (!transferRequest || !socketRef.current) return;
+
+    const reason = 'User declined the transfer';
+    log.warn('❌ Declining transfer from:', transferRequest.from);
+    
+    // Emit rejection to sender
+    socketRef.current.emit('transfer-rejected', {
+      roomId,
+      to: transferRequest.from,
+      reason,
+    });
+
+    // Close modal
+    setTransferRequest(null);
   };
 
   const handleFileSelect = (e) => {
@@ -435,10 +540,6 @@ function App() {
       setSelectedFile(file);
       setTransferComplete(false);
       setDownloadReady(false);
-      // Auto-send on drop
-      setTimeout(() => {
-        sendFileDirectly(file);
-      }, 100);
     }
   };
 
@@ -572,14 +673,6 @@ function App() {
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-  };
-
-  const joinRoom = () => {
-    if (socket && roomId.trim()) {
-      console.log('🚪 Joining room:', roomId);
-      setCurrentRoom(roomId);
-      socket.emit('join-room', roomId);
-    }
   };
 
   const joinRoom = () => {
@@ -947,6 +1040,85 @@ function App() {
             </div>
           )}
         </div>
+
+        {/* Consent Modal */}
+        {transferRequest && (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+            <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8 max-w-md w-full animate-fadeIn">
+              <div className="text-center mb-6">
+                <div className="inline-block p-4 bg-blue-600 rounded-2xl mb-4">
+                  <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                  </svg>
+                </div>
+                <h2 className="text-2xl font-bold text-white mb-2">Incoming File</h2>
+                <p className="text-gray-400 text-sm">Someone wants to send you a file</p>
+              </div>
+
+              <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 mb-6">
+                <div className="space-y-2">
+                  <div className="flex justify-between">
+                    <span className="text-gray-400 text-sm">File Name:</span>
+                    <span className="text-white text-sm font-medium">{transferRequest.metadata.name}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-400 text-sm">File Size:</span>
+                    <span className="text-white text-sm font-medium">{formatFileSize(transferRequest.metadata.size)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-400 text-sm">File Type:</span>
+                    <span className="text-white text-sm font-medium">{transferRequest.metadata.type || 'Unknown'}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={handleDeclineTransfer}
+                  className="flex-1 px-6 py-3 bg-gray-700 text-white rounded-xl font-medium hover:bg-gray-600 transition"
+                >
+                  Decline
+                </button>
+                <button
+                  onClick={handleAcceptTransfer}
+                  className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 transition"
+                >
+                  Accept
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Waiting for Acceptance Modal */}
+        {waitingForAcceptance && (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+            <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8 max-w-md w-full text-center">
+              <div className="inline-block p-4 bg-yellow-600 rounded-2xl mb-4">
+                <svg className="w-12 h-12 text-white animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">Waiting for Acceptance</h2>
+              <p className="text-gray-400">The receiver is reviewing your file transfer request...</p>
+            </div>
+          </div>
+        )}
+
+        {/* Transfer Declined Modal */}
+        {transferDeclined && (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+            <div className="bg-gray-800 border border-gray-700 rounded-3xl shadow-2xl p-8 max-w-md w-full text-center">
+              <div className="inline-block p-4 bg-red-600 rounded-2xl mb-4">
+                <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">Transfer Declined</h2>
+              <p className="text-gray-400">{declineReason}</p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -71,6 +71,29 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle file transfer request
+  socket.on('transfer-request', ({ metadata }) => {
+    console.log(`📄 Transfer request from ${socket.id}:`, metadata.name);
+    // Broadcast to others in the room
+    socket.rooms.forEach((room) => {
+      if (room !== socket.id) {
+        socket.to(room).emit('transfer-request', { from: socket.id, metadata });
+      }
+    });
+  });
+
+  // Handle transfer acceptance
+  socket.on('transfer-accepted', ({ to }) => {
+    console.log(`✅ Transfer accepted by ${socket.id}, notifying ${to}`);
+    io.to(to).emit('transfer-accepted', { from: socket.id });
+  });
+
+  // Handle transfer rejection
+  socket.on('transfer-rejected', ({ to, reason }) => {
+    console.log(`❌ Transfer rejected by ${socket.id}, notifying ${to}`);
+    io.to(to).emit('transfer-rejected', { from: socket.id, reason });
+  });
+
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log('❌ User disconnected:', socket.id);
@@ -91,7 +114,7 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = 5000;
+const PORT = 5001;
 server.listen(PORT, () => {
   console.log(`🚀 Signaling server running on http://localhost:${PORT}`);
 });
