@@ -88,6 +88,15 @@ function App() {
   };
 
   useEffect(() => {
+    // Check for room ID in URL parameters
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomIdFromUrl = urlParams.get('roomID');
+    
+    if (roomIdFromUrl) {
+      log.info('🔗 Room ID detected from URL:', roomIdFromUrl);
+      setRoomId(roomIdFromUrl);
+    }
+    
     // Connect to signaling server
     log.info('Initializing socket connection to signaling server');
     const newSocket = io(SERVER_URL);
@@ -97,6 +106,13 @@ function App() {
       setConnected(true);
       setSocket(newSocket);
       setConnectionState(ConnectionState.DISCONNECTED);
+      
+      // Auto-join if room ID was in URL
+      if (roomIdFromUrl && roomIdFromUrl.trim()) {
+        log.info('🚪 Auto-joining room from URL:', roomIdFromUrl);
+        setCurrentRoom(roomIdFromUrl);
+        newSocket.emit('join-room', roomIdFromUrl);
+      }
     });
 
     newSocket.on('disconnect', () => {
@@ -860,10 +876,11 @@ function App() {
               {isInitiator && connectionState !== ConnectionState.FAILED && (
                 <div className="inline-block p-6 bg-white rounded-2xl">
                   <QRCodeSVG 
-                    value={`${window.location.origin}?room=${currentRoom}`} 
+                    value={`${window.location.origin}/?roomID=${currentRoom}`} 
                     size={200}
                     level="H"
                   />
+                  <p className="text-xs text-gray-600 text-center mt-2">Scan to join instantly</p>
                 </div>
               )}
             </div>
@@ -980,7 +997,7 @@ function App() {
                   onDragLeave={handleDragLeave}
                   onDrop={handleDrop}
                   onClick={() => fileInputRef.current?.click()}
-                  className={`relative border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300 ${
+                  className={`relative border-2 border-dashed rounded-2xl p-8 md:p-12 text-center cursor-pointer transition-all duration-300 ${
                     isDragging 
                       ? 'border-blue-500 bg-blue-900 bg-opacity-20 scale-105' 
                       : 'border-gray-600 hover:border-gray-500 hover:bg-gray-900'
@@ -994,18 +1011,22 @@ function App() {
                   />
                   
                   <div className="space-y-4">
-                    <div className="inline-block p-6 bg-gray-900 rounded-2xl">
-                      <svg className="w-16 h-16 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <div className="inline-block p-4 md:p-6 bg-gray-900 rounded-2xl">
+                      <svg className="w-12 h-12 md:w-16 md:h-16 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                       </svg>
                     </div>
                     
                     <div>
-                      <h3 className="text-xl font-semibold text-white mb-2">
-                        {isDragging ? 'Drop file here' : 'Drop files to send'}
+                      <h3 className="text-lg md:text-xl font-semibold text-white mb-2">
+                        {isDragging ? 'Drop file here' : (
+                          <span className="hidden md:inline">Drop files to send</span>
+                        )}
+                        <span className="md:hidden">Tap to Upload</span>
                       </h3>
                       <p className="text-gray-400 text-sm">
-                        or click to browse
+                        <span className="hidden md:inline">or click to browse</span>
+                        <span className="md:hidden">Select file from device</span>
                       </p>
                     </div>
 
