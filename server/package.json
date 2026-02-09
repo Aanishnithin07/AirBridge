@@ -16,6 +16,7 @@
     "cors": "^2.8.5",
     "express": "^5.2.1",
     "nodemon": "^3.1.11",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "unique-names-generator": "^4.7.1"
   }
 }
